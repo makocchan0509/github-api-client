@@ -4,18 +4,21 @@ import (
 	"cloud.google.com/go/datastore"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 )
 
 func main() {
 	token := os.Getenv("GITHUB_TOKEN")
-	//project := os.Getenv("PROJECT_ID")
+	project := os.Getenv("PROJECT_ID")
 
-	url := "https://api.github.com/users/makocchan0509/events?per_page=5"
+	url := "https://api.github.com/users/makocchan0509/events/public?per_page=80"
 	header := map[string]string{
 		"Accept":        "application/vnd.github+json",
 		"Authorization": token,
@@ -25,22 +28,65 @@ func main() {
 		log.Printf("http client error: %v\n", err)
 		return
 	}
-	defer httpClient.Close()
 
 	httpClient.setHeader(header)
 	httpClient.SendRequest()
 
-	var event []EventResp
+	var events []EventResp
 	b, err := ioutil.ReadAll(httpClient.resp.Body)
 	if err != nil {
 		log.Printf("response parse error :%v\n", err)
 		return
 	}
-	if err := json.Unmarshal(b, &event); err != nil {
+	httpClient.Close()
+	if err := json.Unmarshal(b, &events); err != nil {
 		log.Printf("response json parse:%v\n", err)
 		return
 	}
 
+	//log.Println(events)
+
+	ctx := context.Background()
+	dataStoreClient, err := newDataStoreClient(ctx, project)
+	if err != nil {
+		log.Printf("datastore client error:%v\n", err)
+		return
+	}
+	defer dataStoreClient.close()
+
+	for _, event := range events {
+
+		record := ExtractedEvent{}
+		ID, err := strconv.ParseInt(event.Id, 10, 64)
+		if err != nil {
+			log.Printf("string to int64 parse error :%v\n", err)
+			return
+		}
+		dataStoreClient.generateIDKey("github-event", ID)
+
+		err = dataStoreClient.get(ctx, record)
+		if errors.Is(err, datastore.ErrNoSuchEntity) {
+
+			record = ExtractedEvent{
+				Type:         event.Type,
+				DisplayLogin: event.Actor.DisplayLogin,
+				RepoName:     event.Repo.Name,
+				Commits:      event.Payload.Commits,
+				Public:       event.Public,
+				CreatedAt:    event.CreatedAt,
+			}
+			if err := dataStoreClient.put(ctx, record); err != nil {
+				log.Printf("put record error datastore:%v\n", err)
+				return
+			}
+		} else if err != nil {
+			log.Printf("get record error from datastore:%v\n", err)
+			return
+		} else {
+			log.Printf("getted record exists at datastore:%v\n", dataStoreClient.taskKey.ID)
+		}
+
+	}
 }
 
 type HttpClient struct {
@@ -133,7 +179,6 @@ type Commit struct {
 }
 
 type ExtractedEvent struct {
-	Id           string    `json:"id"`
 	Type         string    `json:"type"`
 	DisplayLogin string    `json:"display_login"`
 	RepoName     string    `json:"repo_name"`
@@ -163,10 +208,20 @@ func (dc *dataStoreClient) generateIDKey(kind string, id int64) {
 }
 
 func (dc *dataStoreClient) put(ctx context.Context, entity ExtractedEvent) error {
+	fmt.Println("data store put", entity)
 	if _, err := dc.client.Put(ctx, dc.taskKey, &entity); err != nil {
 		log.Printf("Failed to save entity: %v\n", err)
 		return err
 	}
+	return nil
+}
+
+func (dc *dataStoreClient) get(ctx context.Context, entity ExtractedEvent) error {
+	fmt.Println("get key: ", dc.taskKey.ID)
+	if err := dc.client.Get(ctx, dc.taskKey, &entity); err != nil {
+		return err
+	}
+	fmt.Println("data store get result", entity)
 	return nil
 }
 
